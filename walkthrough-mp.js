@@ -1,7 +1,24 @@
 // Walkthrough.js - Auto-Configuring Multi-Page AI Walkthrough Generator
 
-// OpenAI API Key (Replace with your actual key)
-const OPENAI_API_KEY = "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"; // Replace with a valid OpenAI API key
+// OpenAI API key is never hardcoded here. Each visitor supplies their own key,
+// which is kept only in this browser's localStorage and sent directly to
+// api.openai.com - it is never bundled into the source or sent anywhere else.
+const OPENAI_API_KEY_STORAGE_KEY = "walkthrough_openai_api_key";
+
+function getOpenAIApiKey() {
+    let key = localStorage.getItem(OPENAI_API_KEY_STORAGE_KEY);
+    if (!key) {
+        key = window.prompt(
+            "Enter your OpenAI API key to generate a walkthrough.\n" +
+            "It is stored only in this browser and sent only to api.openai.com."
+        );
+        if (key) {
+            localStorage.setItem(OPENAI_API_KEY_STORAGE_KEY, key.trim());
+            key = key.trim();
+        }
+    }
+    return key;
+}
 
 // ================================================
 // Domain-specific storage with expiration
@@ -1860,9 +1877,15 @@ function updateElementStatus(message) {
 // Call the OpenAI API to Generate Walkthrough Steps
 // ================================================
 async function generateWalkthrough(userInput) {
+    const apiKey = getOpenAIApiKey();
+    if (!apiKey) {
+        showToast("An OpenAI API key is required to generate a walkthrough.", "error");
+        return [];
+    }
+
     const currentPage = window.location.pathname;
     walkthroughState.userQuery = userInput;
-    
+
     // Show loading state
     document.getElementById("wt-modal-body").style.display = "none";
     document.getElementById("wt-loading").style.display = "flex";
@@ -1977,7 +2000,7 @@ async function generateWalkthrough(userInput) {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${OPENAI_API_KEY}`
+                "Authorization": `Bearer ${apiKey}`
             },
             body: JSON.stringify({
                 model: "gpt-4-turbo",
