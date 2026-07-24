@@ -643,15 +643,37 @@ function injectUI() {
 let domObserver = null;
 let pendingElementUpdate = false;
 
+// Elements injected by this script itself (status logs, toasts, modal, etc.)
+// Mutating these doesn't reflect a real change to the page, so the observer
+// below must ignore them - otherwise updateElementsFromDOM() appending a log
+// entry would retrigger the observer, which reruns updateElementsFromDOM(),
+// which appends another log entry, forever.
+const WT_OWN_UI_SELECTOR =
+    '#wt-floating-icon, #wt-query-modal, #wt-walkthrough-status, ' +
+    '.wt-toast, .wt-page-transition-indicator';
+
+function isWalkthroughOwnMutation(target) {
+    const el = target.nodeType === Node.ELEMENT_NODE ? target : target.parentElement;
+    return !!(el && el.closest && el.closest(WT_OWN_UI_SELECTOR));
+}
+
 // Function to set up DOM mutation observer
 function setupDOMObserver() {
     // Cancel any existing observer
     if (domObserver) {
         domObserver.disconnect();
     }
-    
+
     // Create a new observer instance
     domObserver = new MutationObserver((mutations) => {
+        // Ignore mutations caused by our own injected UI (see comment above)
+        const hasRealPageMutation = mutations.some(
+            mutation => !isWalkthroughOwnMutation(mutation.target)
+        );
+        if (!hasRealPageMutation) {
+            return;
+        }
+
         // Debounce element updates to avoid excessive processing
         if (!pendingElementUpdate) {
             pendingElementUpdate = true;
@@ -1716,142 +1738,69 @@ async function crawlSite() {
     showToast(`Site exploration complete. Found ${Object.keys(walkthroughState.allElements).length} pages.`, "success");
 }
 
-// IMPROVED: Enhanced iframe crawling
+// Crawl a page by fetching its raw HTML and parsing it with DOMParser.
+// Deliberately avoids loading pages in a live iframe: this site's own
+// walkthrough-mp.js script tag would execute inside that iframe and kick off
+// its own crawlSite() call, recursively spawning further nested iframes.
+// Parsing inert HTML means the target page's scripts never run.
 async function crawlPageInIframe(pageUrl) {
-    return new Promise((resolve, reject) => {
-        // First, check if the URL is valid
-        if (!pageUrl || typeof pageUrl !== 'string' || pageUrl.trim() === '') {
-            reject(new Error('Invalid URL provided'));
-            return;
+    if (!pageUrl || typeof pageUrl !== 'string' || pageUrl.trim() === '') {
+        console.warn('Invalid URL provided for crawling');
+        return [];
+    }
+
+    // Ensure we have a full URL
+    let fullUrl = pageUrl;
+    if (!pageUrl.startsWith('http') && !pageUrl.startsWith('/')) {
+        fullUrl = '/' + pageUrl;
+    }
+
+    try {
+        const response = await fetch(fullUrl);
+
+        if (!response.ok) {
+            console.warn(`Failed to fetch page: ${pageUrl} (status ${response.status})`);
+            return [];
         }
-        
-        // Ensure we have a full URL
-        let fullUrl = pageUrl;
-        if (!pageUrl.startsWith('http') && !pageUrl.startsWith('/')) {
-            fullUrl = '/' + pageUrl;
-        }
-        
-        // Create a hidden iframe
-        const iframe = document.createElement('iframe');
-        iframe.style.width = '0';
-        iframe.style.height = '0';
-        iframe.style.border = 'none';
-        iframe.style.position = 'absolute';
-        iframe.style.left = '-9999px';
-        iframe.setAttribute('title', 'Walkthrough crawler iframe');
-        iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts');
-        
-        // Set a timeout in case the page doesn't load
-        const timeout = setTimeout(() => {
-            try {
-                document.body.removeChild(iframe);
-            } catch (e) { /* iframe might be already removed */ }
-            console.warn(`Timeout loading page: ${pageUrl}`);
-            resolve([]); // Return empty array instead of rejecting to avoid stopping crawl
-        }, 10000);
-        
-        // Handle iframe load
-        iframe.onload = () => {
-            clearTimeout(timeout);
-            try {
-                // Extract elements from the iframe's document
-                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                
-                // Skip if we can't access the iframe content (cross-origin)
-                if (!iframeDoc) {
-                    console.warn(`Can't access content of ${pageUrl} (possible CORS issue)`);
-                    document.body.removeChild(iframe);
-                    resolve([]); // Return empty array instead of rejecting
-                    return;
-                }
-                
+
+        const html = await response.text();
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+
+        const elements = Array.from(doc.querySelectorAll('*'))
+            .filter(el => {
+                // We can't reliably compute visibility on a detached, unrendered
+                // document, so just filter down to interactive elements.
+                const tag = el.tagName.toLowerCase();
+                return ['a', 'button', 'input', 'select', 'textarea'].includes(tag) ||
+                    el.hasAttribute('role') || el.hasAttribute('onclick');
+            })
+            .map((el, index) => {
                 try {
-                    // Use the enhanced element detection
-                    const elements = Array.from(iframeDoc.querySelectorAll('*'))
-                        .filter(el => {
-                            // Extract only visible interactive elements
-                            const tag = el.tagName.toLowerCase();
-                            const isInteractive = [
-                                'a', 'button', 'input', 'select', 'textarea'
-                            ].includes(tag) || el.hasAttribute('role') || el.hasAttribute('onclick');
-                            
-                            // Check visibility using basic means
-                            let style;
-                            try {
-                                style = iframeDoc.defaultView.getComputedStyle(el);
-                            } catch (e) {
-                                return false;
-                            }
-                            
-                            const isVisible = !(
-                                style.display === 'none' || 
-                                style.visibility === 'hidden' || 
-                                parseFloat(style.opacity) === 0 ||
-                                el.offsetWidth === 0 ||
-                                el.offsetHeight === 0
-                            );
-                            
-                            return isInteractive && isVisible;
-                        })
-                        .map((el, index) => {
-                            try {
-                                // Extract basic properties
-                                return {
-                                    id: el.id || `element-${index}`,
-                                    tag: el.tagName.toLowerCase(),
-                                    text: (el.innerText || el.placeholder || el.value || "").substring(0, 100).trim(),
-                                    classList: Array.from(el.classList || []),
-                                    selector: el.id ? 
-                                        `#${el.id}` : 
-                                        el.tagName.toLowerCase() + (el.classList.length > 0 ? `.${Array.from(el.classList).join('.')}` : ''),
-                                    href: el.href || null,
-                                    pathname: el.pathname || null,
-                                    role: el.getAttribute('role') || null,
-                                    page: pageUrl
-                                };
-                            } catch (elementError) {
-                                console.warn(`Error processing element ${index}`, elementError);
-                                return null;
-                            }
-                        })
-                        .filter(el => el !== null); // Remove any null elements
-                    
-                    // Clean up and return the elements
-                    document.body.removeChild(iframe);
-                    resolve(elements);
-                } catch (extractError) {
-                    console.warn(`Error extracting elements from ${pageUrl}`, extractError);
-                    document.body.removeChild(iframe);
-                    resolve([]); // Return empty array instead of rejecting
+                    return {
+                        id: el.id || `element-${index}`,
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.textContent || el.getAttribute('placeholder') || el.getAttribute('value') || "").substring(0, 100).trim(),
+                        classList: Array.from(el.classList || []),
+                        selector: el.id ?
+                            `#${el.id}` :
+                            el.tagName.toLowerCase() + (el.classList.length > 0 ? `.${Array.from(el.classList).join('.')}` : ''),
+                        href: el.getAttribute('href') || null,
+                        role: el.getAttribute('role') || null,
+                        page: pageUrl
+                    };
+                } catch (elementError) {
+                    console.warn(`Error processing element ${index}`, elementError);
+                    return null;
                 }
-            } catch (error) {
-                console.warn(`General error processing iframe for ${pageUrl}`, error);
-                try {
-                    document.body.removeChild(iframe);
-                } catch (e) { /* iframe might be already removed */ }
-                resolve([]); // Return empty array instead of rejecting
-            }
-        };
-        
-        // Handle errors
-        iframe.onerror = (error) => {
-            console.warn(`Error loading iframe for ${pageUrl}`, error);
-            clearTimeout(timeout);
-            try {
-                document.body.removeChild(iframe);
-            } catch (e) { /* iframe might be already removed */ }
-            resolve([]); // Return empty array instead of rejecting
-        };
-        
-        try {
-            // Set the iframe source and add it to the document
-            iframe.src = fullUrl;
-            document.body.appendChild(iframe);
-        } catch (error) {
-            console.warn(`Error creating iframe for ${pageUrl}`, error);
-            resolve([]); // Return empty array instead of rejecting
-        }
-    });
+            })
+            .filter(el => el !== null); // Remove any null elements
+
+        return elements;
+    } catch (error) {
+        console.warn(`Error fetching/parsing page: ${pageUrl}`, error);
+        return [];
+    }
 }
 
 function updateElementStatus(message) {
